@@ -79,7 +79,7 @@ function buildEmailHtml(p: {
           <tr><td style="padding:12px 8px;background:#f3f4f6;font-size:16px;"><strong>Total Refunded</strong></td><td style="padding:12px 8px;background:#f3f4f6;font-size:16px;text-align:right;"><strong>${sym}${p.totalAmount.toLocaleString()}</strong></td></tr>
         </table>
         ${p.reason ? `<p style="background:#fffbeb;border-left:3px solid #f59e0b;padding:10px 14px;margin:16px 0;"><strong>Note:</strong> ${p.reason}</p>` : ""}
-        <p>Your LMS access has been suspended as part of this refund. If this was done in error, please reply to this email.</p>
+        <p>Your LMS access has been suspended as part of this refund. You will receive another email with the transaction details and proof of the refund. If this was done in error, please reply to this email.</p>
         <hr style="border:none;border-top:1px solid #eee;margin:24px 0;"/>
         <div style="font-size:13px;color:#666;line-height:1.6;">
           <p style="margin:0;"><strong>${p.companyName}</strong></p>
@@ -177,14 +177,32 @@ const handler = async (req: Request): Promise<Response> => {
     }
 
     // Resolve enrollment name (course or pathway)
-    let enrollmentName = "your enrollment";
-    if (courseIds.length) {
-      const { data: c } = await supabase.from("courses").select("title").in("id", courseIds as string[]);
-      if (c?.length) enrollmentName = c.map(x => x.title).join(", ");
-    } else if (pathwayIds.length) {
-      const { data: p } = await supabase.from("pathways").select("name").in("id", pathwayIds as string[]);
-      if (p?.length) enrollmentName = p.map(x => x.name).join(", ");
+    const names: string[] = [];
+    let resolvedCourseIds = [...courseIds];
+    let resolvedPathwayIds = [...pathwayIds];
+
+    // Fallback: derive from student's enrollments if invoices lack course/pathway ids
+    if (!resolvedCourseIds.length && !resolvedPathwayIds.length) {
+      const { data: enrolls } = await supabase
+        .from("course_enrollments")
+        .select("course_id, pathway_id")
+        .eq("student_id", studentId);
+      if (enrolls?.length) {
+        resolvedCourseIds = [...new Set(enrolls.map(e => e.course_id).filter(Boolean))] as string[];
+        resolvedPathwayIds = [...new Set(enrolls.map(e => e.pathway_id).filter(Boolean))] as string[];
+      }
     }
+
+    if (resolvedCourseIds.length) {
+      const { data: c } = await supabase.from("courses").select("title").in("id", resolvedCourseIds as string[]);
+      if (c?.length) names.push(...c.map(x => x.title).filter(Boolean));
+    }
+    if (resolvedPathwayIds.length) {
+      const { data: p } = await supabase.from("learning_pathways").select("name").in("id", resolvedPathwayIds as string[]);
+      if (p?.length) names.push(...p.map(x => x.name).filter(Boolean));
+    }
+
+    const enrollmentName = names.length ? names.join(", ") : "your enrollment";
 
     // Company settings
     const { data: company } = await supabase
@@ -197,6 +215,24 @@ const handler = async (req: Request): Promise<Response> => {
     const companyPhone = company?.primary_phone || "";
     const companyAddress = company?.address || "";
     const currency = company?.currency || "USD";
+
+    // Add note to student record (visible in Student Notes panel)
+    if (userId) {
+      const installmentList = invoices.map(i => `#${i.installment_number}`).join(", ");
+      const noteText = `Refund processed: ${currencySymbol(company?.currency || "USD")}${totalRefund.toLocaleString()} for installment(s) ${installmentList}. Method: ${body.refund_method}. Reason: ${body.reason}`;
+      await supabase.from("user_activity_logs").insert({
+        user_id: userId,
+        activity_type: "admin_note",
+        occurred_at: new Date().toISOString(),
+        metadata: {
+          note: noteText,
+          created_by: body.performed_by || null,
+          source: "refund",
+          invoice_ids: body.invoice_ids,
+          total_refund: totalRefund,
+        },
+      });
+    }
 
     // Log to admin_logs
     await supabase.from("admin_logs").insert({
