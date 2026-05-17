@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { supabase } from '@/integrations/supabase/client';
 import { useAuth } from '@/hooks/useAuth';
 import { logger } from '@/lib/logger';
+import { getStudentVideoAccessState } from '@/lib/student-video-access';
 import type { CourseRecording, CourseModule } from '@/hooks/useCourseRecordings';
 
 export interface CourseGroup {
@@ -11,7 +12,41 @@ export interface CourseGroup {
   modules: CourseModule[];
   totalLessons: number;
   watchedLessons: number;
+  isCurrentPathwayCourse?: boolean;
+  isCompletedPathwayCourse?: boolean;
 }
+
+interface PathwayCourseAccess {
+  courseId: string;
+  isCurrent: boolean;
+  isCompleted: boolean;
+}
+
+interface LessonRow {
+  id: string;
+  recording_title: string | null;
+  recording_url: string | null;
+  sequence_order: number | null;
+  duration_min: number | null;
+  module: string;
+  assignment_id: string | null;
+}
+
+interface UnlockStatusRow {
+  recording_id: string;
+  is_unlocked: boolean;
+  lock_reason: string | null;
+  drip_unlock_date: string | null;
+}
+
+interface SubmissionRow {
+  assignment_id: string;
+  status: string;
+  version: number | null;
+  created_at: string | null;
+}
+
+const EMPTY_PATHWAY_ACCESS: PathwayCourseAccess[] = [];
 
 interface UsePathwayGroupedRecordingsReturn {
   courseGroups: CourseGroup[];
@@ -29,7 +64,8 @@ interface UsePathwayGroupedRecordingsReturn {
  * Used for non-batch pathway students.
  */
 export function usePathwayGroupedRecordings(
-  pathwayId: string | null
+  pathwayId: string | null,
+  pathwayCoursesAccess: PathwayCourseAccess[] = EMPTY_PATHWAY_ACCESS
 ): UsePathwayGroupedRecordingsReturn {
   const { user } = useAuth();
   const [courseGroups, setCourseGroups] = useState<CourseGroup[]>([]);
@@ -65,13 +101,14 @@ export function usePathwayGroupedRecordings(
 
       const courseIds = pathwayCourses.map(pc => pc.course_id);
 
-      // Fetch courses, modules, views, submissions, and student LMS status in parallel
+      // Fetch courses, modules, views, submissions, student LMS status, and access overrides in parallel
       const [
         { data: coursesData },
         { data: modulesData },
         { data: viewsData },
         { data: submissionsData },
         { data: studentData },
+        videoAccessState,
       ] = await Promise.all([
         supabase.from('courses').select('id, title').in('id', courseIds),
         supabase.from('modules').select('id, title, order, course_id').in('course_id', courseIds).order('order', { ascending: true }),
@@ -81,20 +118,30 @@ export function usePathwayGroupedRecordings(
           .select('assignment_id, status, version, created_at')
           .eq('student_id', user.id),
         supabase.from('users').select('lms_status').eq('id', user.id).maybeSingle(),
+        getStudentVideoAccessState(user.id),
       ]);
 
       const studentLMSStatus = studentData?.lms_status || 'active';
 
+      // Bypass detection: if ANY active enrollment for this student has drip disabled
+      // or sequential disabled, all visible pathway videos are fully unlocked.
+      const studentHasBypass = videoAccessState.hasVideoBypass;
+
+      const fullBypassCourseIds = new Set<string>();
+      if (studentHasBypass) {
+        courseIds.forEach((cid) => fullBypassCourseIds.add(cid));
+      }
+
       // Fetch lessons for all modules
       const moduleIds = modulesData?.map(m => m.id) || [];
-      let lessonsData: any[] = [];
+      let lessonsData: LessonRow[] = [];
       if (moduleIds.length > 0) {
         const { data } = await supabase
           .from('available_lessons')
           .select('id, recording_title, recording_url, sequence_order, duration_min, module, assignment_id')
           .in('module', moduleIds)
           .order('sequence_order', { ascending: true });
-        lessonsData = data || [];
+        lessonsData = (data || []) as LessonRow[];
       }
 
       // Fetch unlock status for all courses in parallel
@@ -107,7 +154,7 @@ export function usePathwayGroupedRecordings(
               p_user_id: user.id,
               p_course_id: pc.course_id,
             });
-            return res.data || [];
+            return (res.data || []) as UnlockStatusRow[];
           } catch {
             return [];
           }
@@ -115,7 +162,7 @@ export function usePathwayGroupedRecordings(
       );
 
       unlockResults.forEach(unlockData => {
-        (unlockData as any[]).forEach((u: any) => {
+        unlockData.forEach((u) => {
           unlockStatusMap.set(u.recording_id, {
             isUnlocked: u.is_unlocked,
             lockReason: u.lock_reason,
@@ -126,9 +173,10 @@ export function usePathwayGroupedRecordings(
 
       // Build lookup maps
       const courseMap = new Map((coursesData || []).map(c => [c.id, c.title]));
+      const pathwayAccessMap = new Map(pathwayCoursesAccess.map(course => [course.courseId, course]));
       const watchedMap = new Map((viewsData || []).map(v => [v.recording_id, v.watched]));
       const latestSubmissionByAssignment = new Map<string, { status: string; version: number; createdAt: number }>();
-      (submissionsData || []).forEach((submission: any) => {
+      ((submissionsData || []) as SubmissionRow[]).forEach((submission) => {
         const version = Number(submission.version || 0);
         const createdAt = submission.created_at ? new Date(submission.created_at).getTime() : 0;
         const existing = latestSubmissionByAssignment.get(submission.assignment_id);
@@ -167,6 +215,10 @@ export function usePathwayGroupedRecordings(
       const groups: CourseGroup[] = pathwayCourses.map(pc => {
         const courseTitle = courseMap.get(pc.course_id) || 'Unknown Course';
         const courseModules = (modulesData || []).filter(m => m.course_id === pc.course_id);
+        const pathwayAccess = pathwayAccessMap.get(pc.course_id);
+        const isCurrentPathwayCourse = pathwayAccess?.isCurrent ?? false;
+        const isCompletedPathwayCourse = pathwayAccess?.isCompleted ?? false;
+        const courseHasBypass = fullBypassCourseIds.has(pc.course_id);
 
         let courseTotalLessons = 0;
         let courseWatchedLessons = 0;
@@ -186,6 +238,13 @@ export function usePathwayGroupedRecordings(
             lockReason = status?.lockReason || null;
             dripUnlockDate = status?.dripUnlockDate || null;
 
+            // Bypass: when this student's enrollment has drip disabled (and/or sequential disabled),
+            // assignment locks must not apply either — unlock unconditionally.
+            if (courseHasBypass) {
+              isUnlocked = true;
+              lockReason = null;
+              dripUnlockDate = null;
+            }
             if (isWatched) courseWatchedLessons++;
             courseTotalLessons++;
 
@@ -235,6 +294,8 @@ export function usePathwayGroupedRecordings(
           modules: processedModules,
           totalLessons: courseTotalLessons,
           watchedLessons: courseWatchedLessons,
+          isCurrentPathwayCourse,
+          isCompletedPathwayCourse,
         };
       });
 
@@ -284,31 +345,49 @@ export function usePathwayGroupedRecordings(
           }
         }
 
-        // SAFETY NET: Re-lock lessons that the RPC returned as unlocked but whose
-        // immediate predecessor's assignment is NOT approved. The RPC short-circuits
-        // unlocked when current.watched=true, bypassing the "previous assignment must
-        // be approved" rule.
-        for (let i = 1; i < allCourseRecordings.length; i++) {
+        // SAFETY NET: Re-lock lessons whose chain of predecessors isn't fully complete.
+        // Walks backwards through ALL prior lessons in the course (not just the
+        // immediate one) so a lesson without an assignment between two assignment-gated
+        // lessons can't let the chain "leak" — e.g. lesson 5 stays unlocked because
+        // lesson 4 has no assignment, even though lesson 2's assignment is still pending.
+        // SKIP this safety net entirely for courses where the student's enrollment has
+        // full bypass (drip_override+sequential_override true, both *_enabled false) —
+        // in that case assignment locks must not be enforced.
+        const skipAssignmentSafetyNet = fullBypassCourseIds.has(group.courseId);
+        for (let i = 1; i < allCourseRecordings.length && !skipAssignmentSafetyNet; i++) {
           const current = allCourseRecordings[i];
           if (!current.isUnlocked) continue;
-          const predecessor = allCourseRecordings[i - 1];
-          if (!predecessor) continue;
 
-          if (predecessor.hasAssignment && predecessor.assignmentId && !approvedAssignments.has(predecessor.assignmentId)) {
-            current.isUnlocked = false;
-            current.blockingLessonTitle = predecessor.recording_title;
-            if (declinedAssignments.has(predecessor.assignmentId)) {
-              current.lockReason = 'previous_assignment_declined';
-              current.blockingAssignmentDeclined = true;
-            } else if (submittedAssignments.has(predecessor.assignmentId)) {
-              current.lockReason = 'previous_assignment_not_approved';
-            } else {
-              current.lockReason = 'previous_assignment_not_submitted';
+          let blocker: CourseRecording | null = null;
+          let reason: string | null = null;
+
+          for (let j = i - 1; j >= 0; j--) {
+            const pred = allCourseRecordings[j];
+
+            if (pred.hasAssignment && pred.assignmentId && !approvedAssignments.has(pred.assignmentId)) {
+              blocker = pred;
+              if (declinedAssignments.has(pred.assignmentId)) {
+                reason = 'previous_assignment_declined';
+              } else if (submittedAssignments.has(pred.assignmentId)) {
+                reason = 'previous_assignment_not_approved';
+              } else {
+                reason = 'previous_assignment_not_submitted';
+              }
+              break;
             }
-          } else if (!predecessor.isWatched) {
+
+            if (!pred.isWatched) {
+              blocker = pred;
+              reason = 'previous_lesson_not_watched';
+              break;
+            }
+          }
+
+          if (blocker && reason) {
             current.isUnlocked = false;
-            current.blockingLessonTitle = predecessor.recording_title;
-            current.lockReason = 'previous_lesson_not_watched';
+            current.blockingLessonTitle = blocker.recording_title;
+            current.lockReason = reason;
+            current.blockingAssignmentDeclined = reason === 'previous_assignment_declined';
           }
         }
 
@@ -356,6 +435,11 @@ export function usePathwayGroupedRecordings(
         }
       }
 
+      // Pathway gating is handled purely by the drip timeline set in the pathway
+      // (per-course drip dates from the RPC). We do NOT force-lock future pathway
+      // courses based on whether the current course is completed — the drip date
+      // is the single source of truth.
+
       setCourseGroups(groups);
       setTotalRecordings(allRecordingsCount);
       setTotalWatched(allWatchedCount);
@@ -366,7 +450,7 @@ export function usePathwayGroupedRecordings(
     } finally {
       setLoading(false);
     }
-  }, [user?.id, pathwayId]);
+  }, [user?.id, pathwayId, pathwayCoursesAccess]);
 
   useEffect(() => {
     fetchData();
